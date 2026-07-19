@@ -28,8 +28,15 @@ from utils import (
 # Config
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "google/gemma-2-27b-it"
-VECTOR_MODEL = "gemma-2-27b"
+# Model key -> (official HF checkpoint, chat family). The vector_model field
+# in the assistant-axis repo matches these keys directly, so the key doubles
+# as VECTOR_MODEL.
+MODEL_REGISTRY = {
+    "gemma-2-27b": {"hf_name": "google/gemma-2-27b-it", "chat_family": "gemma"},
+    "qwen-3-32b": {"hf_name": "Qwen/Qwen3-32B", "chat_family": "qwen"},
+    "llama-3.3-70b": {"hf_name": "meta-llama/Llama-3.3-70B-Instruct", "chat_family": "llama"},
+}
+DEFAULT_MODEL = "gemma-2-27b"
 VECTOR_REPO = "lu-christina/assistant-axis-vectors"
 TARGET_LAYER = 22
 N_COMPONENTS = 10
@@ -88,20 +95,23 @@ def load_prompts(path):
 
 class DebateAgent:
     def __init__(self, model, tokenizer, name, system_prompt, persona_space,
-                 layer_idx, gen_cfg: GenConfig):
+                 layer_idx, gen_cfg: GenConfig, chat_family="gemma"):
         self.model = model
         self.tokenizer = tokenizer
         self.name = name
         self.persona_space = persona_space
         self.layer_idx = layer_idx
         self.gen_cfg = gen_cfg
+        self.chat_family = chat_family
         self.messages = []
         self.last_n_new_tokens = 0
 
-        self.is_gemma = "gemma" in model.config.model_type.lower()
-        if self.is_gemma:
+        if chat_family == "gemma":
+            # Gemma-2's chat template has no "system" role, so the system
+            # prompt is folded into the first user turn instead.
             self._pending_system = system_prompt
         else:
+            # Qwen3 and Llama-3.3 both support a real "system" role.
             self._pending_system = None
             self.messages.append({"role": "system", "content": system_prompt})
 
@@ -123,11 +133,19 @@ class DebateAgent:
         self.messages.append({"role": "user", "content": text})
 
     def respond(self):
+        template_kwargs = {}
+        if self.chat_family == "qwen":
+            # Qwen3 defaults to emitting a <think>...</think> block before the
+            # reply; disable it so generated text and activations reflect the
+            # direct response like the other model families.
+            template_kwargs["enable_thinking"] = False
+
         inputs = self.tokenizer.apply_chat_template(
             self.messages,
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+            **template_kwargs,
         ).to(self.model.device)
 
         gen_kwargs = dict(
@@ -168,17 +186,19 @@ class DebateAgent:
 # Debate loop
 # ---------------------------------------------------------------------------
 
-def run_round(round_spec, model, tokenizer, persona_space, n_turns, gen_cfg):
+def run_round(round_spec, model, tokenizer, persona_space, n_turns, gen_cfg, chat_family="gemma"):
     """Yield one record dict per turn."""
     agent_a = DebateAgent(
         model, tokenizer, name="agent_a",
         system_prompt=round_spec["shared_system"] + "\n\n" + round_spec["support_system"],
         persona_space=persona_space, layer_idx=TARGET_LAYER, gen_cfg=gen_cfg,
+        chat_family=chat_family,
     )
     agent_b = DebateAgent(
         model, tokenizer, name="agent_b",
         system_prompt=round_spec["shared_system"] + "\n\n" + round_spec["oppose_system"],
         persona_space=persona_space, layer_idx=TARGET_LAYER, gen_cfg=gen_cfg,
+        chat_family=chat_family,
     )
 
     round_id = round_spec["id"]
@@ -219,6 +239,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompts", default=PROMPTS_PATH)
     parser.add_argument("--out", default=OUTPUT_DIR)
+    parser.add_argument("--model", choices=sorted(MODEL_REGISTRY), default=DEFAULT_MODEL)
     parser.add_argument("--n-turns", type=int, default=N_TURNS)
     parser.add_argument("--seed", type=int, default=SEED)
     return parser.parse_args()
@@ -230,8 +251,13 @@ def main():
 
     prompts = load_prompts(args.prompts)
 
-    persona_space = load_persona_space(VECTOR_MODEL, TARGET_LAYER, VECTOR_REPO)
-    model, tokenizer = load_model(MODEL_NAME)
+    model_info = MODEL_REGISTRY[args.model]
+    model_name = model_info["hf_name"]
+    chat_family = model_info["chat_family"]
+    vector_model = args.model
+
+    persona_space = load_persona_space(vector_model, TARGET_LAYER, VECTOR_REPO)
+    model, tokenizer = load_model(model_name)
 
     gen_cfg = GenConfig(do_sample=DO_SAMPLE, temperature=TEMPERATURE,
                          max_new_tokens=MAX_NEW_TOKENS)
@@ -241,8 +267,8 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     config = {
-        "model_name": MODEL_NAME,
-        "vector_model": VECTOR_MODEL,
+        "model_name": model_name,
+        "vector_model": vector_model,
         "vector_repo": VECTOR_REPO,
         "target_layer": TARGET_LAYER,
         "n_components": N_COMPONENTS,
@@ -265,7 +291,7 @@ def main():
         for round_spec in prompts:
             print(f"=== Round {round_spec['id']}: {round_spec['topic'][:60]}... ===")
             for record in run_round(round_spec, model, tokenizer, persona_space,
-                                     args.n_turns, gen_cfg):
+                                     args.n_turns, gen_cfg, chat_family=chat_family):
                 f.write(json.dumps(record) + "\n")
                 f.flush()
                 n_records += 1
