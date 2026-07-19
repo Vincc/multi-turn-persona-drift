@@ -1,0 +1,14 @@
+{
+  "model_name": "google/gemma-2-27b-it",
+  "vector_model": "gemma-2-27b",
+  "vector_repo": "lu-christina/assistant-axis-vectors",
+  "target_layer": 22,
+  "n_components": 10,
+  "n_turns": 10,
+  "do_sample": false,
+  "temperature": 0.7,
+  "max_new_tokens": 500,
+  "seed": 42,
+  "prompts_path": "prompts.jsonl",
+  "notes": ""
+}

@@ -8,7 +8,6 @@ vectors, and one record per turn is streamed to disk.
 """
 
 import argparse
-import csv
 import json
 import random
 from dataclasses import dataclass
@@ -196,6 +195,7 @@ def run_round(round_spec, model, tokenizer, persona_space, n_turns, gen_cfg):
             "pc_scores": pc_scores,
             "pc1_score": pc_scores[0] if len(pc_scores) > 0 else None,
             "pc2_score": pc_scores[1] if len(pc_scores) > 1 else None,
+            "pc3_score": pc_scores[2] if len(pc_scores) > 2 else None,
             "meta": meta,
         }
 
@@ -222,21 +222,6 @@ def parse_args():
     parser.add_argument("--n-turns", type=int, default=N_TURNS)
     parser.add_argument("--seed", type=int, default=SEED)
     return parser.parse_args()
-
-
-def write_csv(records_path, csv_path):
-    fields = ["round_id", "topic", "turn", "speaker", "pc1_score", "pc2_score",
-              "n_new_tokens", "degenerate", "text"]
-    with open(records_path, "r", encoding="utf-8") as fin, \
-         open(csv_path, "w", newline="", encoding="utf-8") as fout:
-        writer = csv.DictWriter(fout, fieldnames=fields)
-        writer.writeheader()
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            writer.writerow({k: rec.get(k) for k in fields})
 
 
 def main():
@@ -286,8 +271,6 @@ def main():
                 n_records += 1
                 if record["degenerate"]:
                     n_degenerate += 1
-
-    write_csv(records_path, run_dir / "records.csv")
 
     print(f"Done. rounds={len(prompts)} records={n_records} degenerate={n_degenerate}")
     print(f"Output: {run_dir}")
