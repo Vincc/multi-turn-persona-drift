@@ -8,6 +8,7 @@ vectors, and one record per turn is streamed to disk.
 """
 
 import argparse
+import contextlib
 import json
 import random
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ import torch
 
 from utils import (
     ActivationCache,
+    build_activation_capper,
+    load_capping_config,
     load_model,
     load_persona_space,
     project_topk,
@@ -39,6 +42,10 @@ MODEL_REGISTRY = {
 DEFAULT_MODEL = "gemma-2-27b"
 VECTOR_REPO = "lu-christina/assistant-axis-vectors"
 TARGET_LAYER = 22
+# Lu et al.'s recommended qwen-3-32b activation-capping experiment: layers
+# 46-53 (Python half-open range 46:54), capped at the 25th percentile.
+CAP_VECTOR_MODEL = "qwen-3-32b"
+CAP_EXPERIMENT_ID = "layers_46:54-p0.25"
 N_COMPONENTS = 10
 N_TURNS = 10
 DO_SAMPLE = False
@@ -95,7 +102,8 @@ def load_prompts(path):
 
 class DebateAgent:
     def __init__(self, model, tokenizer, name, system_prompt, persona_space,
-                 layer_idx, gen_cfg: GenConfig, chat_family="gemma"):
+                 layer_idx, gen_cfg: GenConfig, chat_family="gemma",
+                 cap_activations=False):
         self.model = model
         self.tokenizer = tokenizer
         self.name = name
@@ -105,6 +113,13 @@ class DebateAgent:
         self.chat_family = chat_family
         self.messages = []
         self.last_n_new_tokens = 0
+
+        self._cap_ctx = contextlib.nullcontext()
+        if cap_activations:
+            if chat_family != "qwen":
+                raise ValueError("cap_activations is only supported for qwen runs")
+            capping_config = load_capping_config(CAP_VECTOR_MODEL, VECTOR_REPO)
+            self._cap_ctx = build_activation_capper(model, capping_config, CAP_EXPERIMENT_ID)
 
         if chat_family == "gemma":
             # Gemma-2's chat template has no "system" role, so the system
@@ -156,8 +171,9 @@ class DebateAgent:
         if self.gen_cfg.do_sample:
             gen_kwargs["temperature"] = self.gen_cfg.temperature
 
-        with torch.no_grad():
-            out = self.model.generate(**inputs, **gen_kwargs)
+        with self._cap_ctx:
+            with torch.no_grad():
+                out = self.model.generate(**inputs, **gen_kwargs)
 
         prompt_len = inputs["input_ids"].shape[-1]
         new_tokens = out[0][prompt_len:]
@@ -186,19 +202,20 @@ class DebateAgent:
 # Debate loop
 # ---------------------------------------------------------------------------
 
-def run_round(round_spec, model, tokenizer, persona_space, n_turns, gen_cfg, chat_family="gemma"):
+def run_round(round_spec, model, tokenizer, persona_space, n_turns, gen_cfg,
+              chat_family="gemma", cap_activations=False):
     """Yield one record dict per turn."""
     agent_a = DebateAgent(
         model, tokenizer, name="agent_a",
         system_prompt=round_spec["shared_system"] + "\n\n" + round_spec["support_system"],
         persona_space=persona_space, layer_idx=TARGET_LAYER, gen_cfg=gen_cfg,
-        chat_family=chat_family,
+        chat_family=chat_family, cap_activations=cap_activations,
     )
     agent_b = DebateAgent(
         model, tokenizer, name="agent_b",
         system_prompt=round_spec["shared_system"] + "\n\n" + round_spec["oppose_system"],
         persona_space=persona_space, layer_idx=TARGET_LAYER, gen_cfg=gen_cfg,
-        chat_family=chat_family,
+        chat_family=chat_family, cap_activations=cap_activations,
     )
 
     round_id = round_spec["id"]
@@ -242,6 +259,10 @@ def parse_args():
     parser.add_argument("--model", choices=sorted(MODEL_REGISTRY), default=DEFAULT_MODEL)
     parser.add_argument("--n-turns", type=int, default=N_TURNS)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--cap-activations", action="store_true",
+                         help="Apply Lu et al.'s activation capping "
+                              f"({CAP_EXPERIMENT_ID}) during generation. "
+                              "Only supported with --model qwen-3-32b.")
     return parser.parse_args()
 
 
@@ -255,6 +276,9 @@ def main():
     model_name = model_info["hf_name"]
     chat_family = model_info["chat_family"]
     vector_model = args.model
+
+    if args.cap_activations and chat_family != "qwen":
+        raise SystemExit("--cap-activations is only supported with --model qwen-3-32b")
 
     persona_space = load_persona_space(vector_model, TARGET_LAYER, VECTOR_REPO)
     model, tokenizer = load_model(model_name)
@@ -278,6 +302,8 @@ def main():
         "max_new_tokens": MAX_NEW_TOKENS,
         "seed": args.seed,
         "prompts_path": str(args.prompts),
+        "cap_activations": args.cap_activations,
+        "cap_experiment_id": CAP_EXPERIMENT_ID if args.cap_activations else None,
         "notes": "",
     }
     with open(run_dir / "config.json", "w", encoding="utf-8") as f:
@@ -291,7 +317,8 @@ def main():
         for round_spec in prompts:
             print(f"=== Round {round_spec['id']}: {round_spec['topic'][:60]}... ===")
             for record in run_round(round_spec, model, tokenizer, persona_space,
-                                     args.n_turns, gen_cfg, chat_family=chat_family):
+                                     args.n_turns, gen_cfg, chat_family=chat_family,
+                                     cap_activations=args.cap_activations):
                 f.write(json.dumps(record) + "\n")
                 f.flush()
                 n_records += 1

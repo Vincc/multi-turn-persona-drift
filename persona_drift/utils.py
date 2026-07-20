@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from sklearn.decomposition import PCA
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -115,6 +115,79 @@ def load_persona_space(vector_model, target_layer, repo_id):
         "variance_explained": variance_explained,
         "role_labels": list(role_vectors.keys()),
     }
+
+
+def load_capping_config(vector_model, repo_id):
+    """
+    Download Lu et al.'s precomputed activation-capping config for a model
+    (assistant-axis repo: assistant_axis.load_capping_config).
+    """
+    path = hf_hub_download(repo_id=repo_id, repo_type="dataset",
+                            filename=f"{vector_model}/capping_config.pt")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+class ActivationCapper:
+    """
+    Registers forward hooks that cap each targeted layer's activations along a
+    fixed direction vector. Vendored from the assistant-axis repo's
+    ActivationSteering (intervention_type="capping", positions="all"):
+
+        v_hat  = v / ||v||
+        excess = clamp(<h, v_hat> - tau, min=0)
+        h      = h - excess * v_hat
+
+    Kept as a minimal, capping-only re-implementation (rather than depending
+    on the assistant-axis package) since that package pulls in vllm as a
+    hard dependency.
+    """
+
+    def __init__(self, model, layer_vectors):
+        # layer_vectors: dict[layer_idx -> (vector: Tensor[d_model], tau: float)]
+        self.model = model
+        self.layer_vectors = layer_vectors
+        self._handles = []
+
+    def _make_hook(self, vector, tau):
+        v = vector / (vector.norm() + 1e-8)
+
+        def hook(module, inputs, output):
+            hs = output[0] if isinstance(output, tuple) else output
+            v_ = v.to(device=hs.device, dtype=hs.dtype)
+            proj = torch.einsum("bld,d->bl", hs, v_)
+            excess = (proj - tau).clamp(min=0.0)
+            capped = hs - torch.einsum("bl,d->bld", excess, v_)
+            return (capped, *output[1:]) if isinstance(output, tuple) else capped
+
+        return hook
+
+    def __enter__(self):
+        for layer_idx, (vector, tau) in self.layer_vectors.items():
+            layer = self.model.model.layers[layer_idx]
+            self._handles.append(layer.register_forward_hook(self._make_hook(vector, tau)))
+        return self
+
+    def __exit__(self, *exc):
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+
+def build_activation_capper(model, capping_config, experiment_id):
+    """Build an ActivationCapper for one named experiment in a loaded capping config."""
+    experiment = next((e for e in capping_config["experiments"] if e["id"] == experiment_id), None)
+    if experiment is None:
+        available = [e["id"] for e in capping_config["experiments"]]
+        raise ValueError(f"Capping experiment {experiment_id!r} not found; available: {available}")
+
+    layer_vectors = {}
+    for iv in experiment["interventions"]:
+        if "cap" not in iv:
+            continue
+        vec_data = capping_config["vectors"][iv["vector"]]
+        layer_vectors[vec_data["layer"]] = (vec_data["vector"].float(), float(iv["cap"]))
+
+    return ActivationCapper(model, layer_vectors)
 
 
 class ActivationCache:
