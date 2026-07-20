@@ -1,0 +1,16 @@
+{
+  "model_name": "Qwen/Qwen3-32B",
+  "vector_model": "qwen-3-32b",
+  "vector_repo": "lu-christina/assistant-axis-vectors",
+  "target_layer": 22,
+  "n_components": 10,
+  "n_turns": 10,
+  "do_sample": false,
+  "temperature": 0.7,
+  "max_new_tokens": 500,
+  "seed": 42,
+  "prompts_path": "prompts.jsonl",
+  "cap_activations": true,
+  "cap_experiment_id": "layers_46:54-p0.25",
+  "notes": "Both agents capped"
+}

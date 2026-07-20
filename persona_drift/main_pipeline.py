@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Multi-turn persona drift: Gemma-2-27B self-play debate pipeline.
-
-Two agents (sharing one model instance) hold a multi-turn discussion from a
-jsonl-defined round spec. Each generated turn's layer-22 activations are
-projected into the persona PC space built from Lu et al.'s published role
-vectors, and one record per turn is streamed to disk.
-"""
-
 import argparse
 import contextlib
 import json
@@ -31,9 +22,6 @@ from utils import (
 # Config
 # ---------------------------------------------------------------------------
 
-# Model key -> (official HF checkpoint, chat family). The vector_model field
-# in the assistant-axis repo matches these keys directly, so the key doubles
-# as VECTOR_MODEL.
 MODEL_REGISTRY = {
     "gemma-2-27b": {"hf_name": "google/gemma-2-27b-it", "chat_family": "gemma"},
     "qwen-3-32b": {"hf_name": "Qwen/Qwen3-32B", "chat_family": "qwen"},
@@ -150,9 +138,6 @@ class DebateAgent:
     def respond(self):
         template_kwargs = {}
         if self.chat_family == "qwen":
-            # Qwen3 defaults to emitting a <think>...</think> block before the
-            # reply; disable it so generated text and activations reflect the
-            # direct response like the other model families.
             template_kwargs["enable_thinking"] = False
 
         inputs = self.tokenizer.apply_chat_template(
